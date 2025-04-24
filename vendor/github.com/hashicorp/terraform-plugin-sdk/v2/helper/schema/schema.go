@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 // schema is a high-level framework for easily writing new providers
 // for Terraform. Usage of schema is recommended over attempting to write
 // to the low-level plugin interfaces manually.
@@ -88,10 +91,6 @@ type Schema struct {
 	// Optional indicates whether the practitioner can choose to not enter
 	// a value in the configuration for this attribute. Optional cannot be used
 	// with Required.
-	//
-	// If also using Default or DefaultFunc, Computed should also be enabled,
-	// otherwise Terraform can output warning logs or "inconsistent result
-	// after apply" errors.
 	Optional bool
 
 	// Computed indicates whether the provider may return its own value for
@@ -146,7 +145,7 @@ type Schema struct {
 	//
 	// The key benefit of activating this flag is that the result of Read or
 	// ReadContext will be cleaned of normalization-only changes in the same
-	// way as the planning result would normaly be, which therefore prevents
+	// way as the planning result would normally be, which therefore prevents
 	// churn for downstream expressions deriving from this attribute and
 	// prevents incorrect "Values changed outside of Terraform" messages
 	// when the remote API returns values which have the same meaning as the
@@ -311,11 +310,33 @@ type Schema struct {
 	// "parent_block_name.0.child_attribute_name".
 	RequiredWith []string
 
-	// Deprecated indicates the message to include in a warning diagnostic to
-	// practitioners when this attribute is configured. Typically this is used
-	// to signal that this attribute will be removed in the future and provide
-	// next steps to the practitioner, such as using a different attribute,
-	// different resource, or if it should just be removed.
+	// Deprecated defines warning diagnostic details to display when
+	// practitioner configurations use this attribute or block. The warning
+	// diagnostic summary is automatically set to "Argument is deprecated"
+	// along with configuration source file and line information.
+	//
+	// Set this field to a practitioner actionable message such as:
+	//
+	//  - "Configure other_attribute instead. This attribute will be removed
+	//    in the next major version of the provider."
+	//  - "Remove this attribute's configuration as it no longer is used and
+	//    the attribute will be removed in the next major version of the
+	//    provider."
+	//
+	// In Terraform 1.2.7 and later, this warning diagnostic is displayed any
+	// time a practitioner attempts to configure a known value for this
+	// attribute and certain scenarios where this attribute is referenced.
+	//
+	// In Terraform 1.2.6 and earlier, this warning diagnostic is only
+	// displayed when the attribute is Required or Optional, and if the
+	// practitioner configuration attempts to set the attribute value to a
+	// known value. It cannot detect practitioner configuration values that
+	// are unknown ("known after apply").
+	//
+	// Additional information about deprecation enhancements for read-only
+	// attributes can be found in:
+	//
+	//  - https://github.com/hashicorp/terraform/issues/7569
 	Deprecated string
 
 	// ValidateFunc allows individual fields to define arbitrary validation
@@ -374,6 +395,18 @@ type Schema struct {
 	// as sensitive. Any outputs containing a sensitive value must enable the
 	// output sensitive argument.
 	Sensitive bool
+
+	// WriteOnly indicates that the practitioner can choose a value for this
+	// attribute, but Terraform will not store this attribute in plan or state.
+	// WriteOnly can only be set for managed resource schemas. If WriteOnly is true,
+	// either Optional or Required must also be true. WriteOnly cannot be set with ForceNew.
+	//
+	// WriteOnly cannot be set to true for TypeList, TypeMap, or TypeSet.
+	//
+	// This functionality is only supported in Terraform 1.11 and later.
+	// Practitioners that choose a value for this attribute with older
+	// versions of Terraform will receive an error.
+	WriteOnly bool
 }
 
 // SchemaConfigMode is used to influence how a schema item is mapped into a
@@ -700,6 +733,9 @@ func (m schemaMap) Diff(
 
 			// Preserve the DestroyTainted flag
 			result2.DestroyTainted = result.DestroyTainted
+			result2.RawConfig = result.RawConfig
+			result2.RawPlan = result.RawPlan
+			result2.RawState = result.RawState
 
 			// Reset the data to not contain state. We have to call init()
 			// again in order to reset the FieldReaders.
@@ -814,6 +850,18 @@ func (m schemaMap) internalValidate(topSchemaMap schemaMap, attrsOnly bool) erro
 			return fmt.Errorf("%s: One of optional, required, or computed must be set", k)
 		}
 
+		if v.WriteOnly && v.Required && v.Optional {
+			return fmt.Errorf("%s: WriteOnly must be set with either Required or Optional", k)
+		}
+
+		if v.WriteOnly && v.Computed {
+			return fmt.Errorf("%s: WriteOnly cannot be set with Computed", k)
+		}
+
+		if v.WriteOnly && v.ForceNew {
+			return fmt.Errorf("%s: WriteOnly cannot be set with ForceNew", k)
+		}
+
 		computedOnly := v.Computed && !v.Optional
 
 		switch v.ConfigMode {
@@ -848,6 +896,14 @@ func (m schemaMap) internalValidate(topSchemaMap schemaMap, attrsOnly bool) erro
 
 		if v.Required && v.Default != nil {
 			return fmt.Errorf("%s: Default cannot be set with Required", k)
+		}
+
+		if v.WriteOnly && v.Default != nil {
+			return fmt.Errorf("%s: Default cannot be set with WriteOnly", k)
+		}
+
+		if v.WriteOnly && v.DefaultFunc != nil {
+			return fmt.Errorf("%s: DefaultFunc cannot be set with WriteOnly", k)
 		}
 
 		if len(v.ComputedWhen) > 0 && !v.Computed {
@@ -899,6 +955,10 @@ func (m schemaMap) internalValidate(topSchemaMap schemaMap, attrsOnly bool) erro
 		}
 
 		if v.Type == TypeList || v.Type == TypeSet {
+			if v.WriteOnly {
+				return fmt.Errorf("%s: WriteOnly is not valid for lists or sets", k)
+			}
+
 			if v.Elem == nil {
 				return fmt.Errorf("%s: Elem must be set for lists", k)
 			}
@@ -915,7 +975,17 @@ func (m schemaMap) internalValidate(topSchemaMap schemaMap, attrsOnly bool) erro
 			case *Resource:
 				attrsOnly := attrsOnly || v.ConfigMode == SchemaConfigModeAttr
 
-				if err := schemaMap(t.Schema).internalValidate(topSchemaMap, attrsOnly); err != nil {
+				blockHasWriteOnly := schemaMap(t.SchemaMap()).hasWriteOnly()
+
+				if v.Type == TypeSet && blockHasWriteOnly {
+					return fmt.Errorf("%s: Set Block type cannot contain WriteOnly attributes", k)
+				}
+
+				if v.Computed && blockHasWriteOnly {
+					return fmt.Errorf("%s: Block types with Computed set to true cannot contain WriteOnly attributes", k)
+				}
+
+				if err := schemaMap(t.SchemaMap()).internalValidate(topSchemaMap, attrsOnly); err != nil {
 					return err
 				}
 			case *Schema:
@@ -932,6 +1002,10 @@ func (m schemaMap) internalValidate(topSchemaMap schemaMap, attrsOnly bool) erro
 		}
 
 		if v.Type == TypeMap && v.Elem != nil {
+			if v.WriteOnly {
+				return fmt.Errorf("%s: WriteOnly is not valid for maps", k)
+			}
+
 			switch v.Elem.(type) {
 			case *Resource:
 				return fmt.Errorf("%s: TypeMap with Elem *Resource not supported,"+
@@ -1045,7 +1119,7 @@ func checkKeysAgainstSchemaFlags(k string, keys []string, topSchemaMap schemaMap
 				return fmt.Errorf("%s configuration block reference (%s) can only be used with TypeList and MaxItems: 1 configuration blocks", k, key)
 			}
 
-			sm = schemaMap(subResource.Schema)
+			sm = subResource.SchemaMap()
 		}
 
 		if target == nil {
@@ -1068,13 +1142,14 @@ func checkKeysAgainstSchemaFlags(k string, keys []string, topSchemaMap schemaMap
 	return nil
 }
 
+var validFieldNameRe = regexp.MustCompile("^[a-z0-9_]+$")
+
 func isValidFieldName(name string) bool {
-	re := regexp.MustCompile("^[a-z0-9_]+$")
-	return re.MatchString(name)
+	return validFieldNameRe.MatchString(name)
 }
 
 // resourceDiffer is an interface that is used by the private diff functions.
-// This helps facilitate diff logic for both ResourceData and ResoureDiff with
+// This helps facilitate diff logic for both ResourceData and ResourceDiff with
 // minimal divergence in code.
 type resourceDiffer interface {
 	diffChange(string) (interface{}, interface{}, bool, bool, bool)
@@ -1094,24 +1169,24 @@ func (m schemaMap) diff(
 	d resourceDiffer,
 	all bool) error {
 
-	unsupressedDiff := new(terraform.InstanceDiff)
-	unsupressedDiff.Attributes = make(map[string]*terraform.ResourceAttrDiff)
+	unsuppressedDiff := new(terraform.InstanceDiff)
+	unsuppressedDiff.Attributes = make(map[string]*terraform.ResourceAttrDiff)
 
 	var err error
 	switch schema.Type {
 	case TypeBool, TypeInt, TypeFloat, TypeString:
-		err = m.diffString(k, schema, unsupressedDiff, d, all)
+		err = m.diffString(k, schema, unsuppressedDiff, d, all)
 	case TypeList:
-		err = m.diffList(ctx, k, schema, unsupressedDiff, d, all)
+		err = m.diffList(ctx, k, schema, unsuppressedDiff, d, all)
 	case TypeMap:
-		err = m.diffMap(k, schema, unsupressedDiff, d, all)
+		err = m.diffMap(k, schema, unsuppressedDiff, d, all)
 	case TypeSet:
-		err = m.diffSet(ctx, k, schema, unsupressedDiff, d, all)
+		err = m.diffSet(ctx, k, schema, unsuppressedDiff, d, all)
 	default:
 		err = fmt.Errorf("%s: unknown type %#v", k, schema.Type)
 	}
 
-	for attrK, attrV := range unsupressedDiff.Attributes {
+	for attrK, attrV := range unsuppressedDiff.Attributes {
 		switch rd := d.(type) {
 		case *ResourceData:
 			if schema.DiffSuppressFunc != nil && attrV != nil &&
@@ -1234,7 +1309,7 @@ func (m schemaMap) diffList(
 	case *Resource:
 		// This is a complex resource
 		for i := 0; i < maxLen; i++ {
-			for k2, schema := range t.Schema {
+			for k2, schema := range t.SchemaMap() {
 				subK := fmt.Sprintf("%s.%d.%s", k, i, k2)
 				err := m.diff(ctx, subK, schema, diff, d, all)
 				if err != nil {
@@ -1481,7 +1556,7 @@ func (m schemaMap) diffSet(
 			switch t := schema.Elem.(type) {
 			case *Resource:
 				// This is a complex resource
-				for k2, schema := range t.Schema {
+				for k2, schema := range t.SchemaMap() {
 					subK := fmt.Sprintf("%s.%s.%s", k, code, k2)
 					err := m.diff(ctx, subK, schema, diff, d, true)
 					if err != nil {
@@ -1710,15 +1785,7 @@ func (m schemaMap) validate(
 	// The SDK has to allow the unknown value through initially, so that
 	// Required fields set via an interpolated value are accepted.
 	if !isWhollyKnown(raw) {
-		if schema.Deprecated != "" {
-			return append(diags, diag.Diagnostic{
-				Severity:      diag.Warning,
-				Summary:       "Argument is deprecated",
-				Detail:        schema.Deprecated,
-				AttributePath: path,
-			})
-		}
-		return diags
+		return nil
 	}
 
 	err = validateConflictingAttributes(k, schema, c)
@@ -1921,7 +1988,7 @@ func (m schemaMap) validateList(
 		return append(diags, diag.Diagnostic{
 			Severity:      diag.Error,
 			Summary:       "Too many list items",
-			Detail:        fmt.Sprintf("Attribute supports %d item maximum, but config has %d declared.", schema.MaxItems, rawV.Len()),
+			Detail:        fmt.Sprintf("Attribute %s supports %d item maximum, but config has %d declared.", k, schema.MaxItems, rawV.Len()),
 			AttributePath: path,
 		})
 	}
@@ -1930,7 +1997,7 @@ func (m schemaMap) validateList(
 		return append(diags, diag.Diagnostic{
 			Severity:      diag.Error,
 			Summary:       "Not enough list items",
-			Detail:        fmt.Sprintf("Attribute requires %d item minimum, but config has only %d declared.", schema.MinItems, rawV.Len()),
+			Detail:        fmt.Sprintf("Attribute %s requires %d item minimum, but config has only %d declared.", k, schema.MinItems, rawV.Len()),
 			AttributePath: path,
 		})
 	}
@@ -1956,7 +2023,7 @@ func (m schemaMap) validateList(
 		switch t := schema.Elem.(type) {
 		case *Resource:
 			// This is a sub-resource
-			diags = append(diags, m.validateObject(key, t.Schema, c, p)...)
+			diags = append(diags, m.validateObject(key, t.SchemaMap(), c, p)...)
 		case *Schema:
 			diags = append(diags, m.validateType(key, raw, t, c, p)...)
 		}
@@ -2109,7 +2176,7 @@ func validateMapValues(k string, m map[string]interface{}, schema *Schema, path 
 				})
 			}
 		default:
-			panic(fmt.Sprintf("Unknown validation type: %#v", schema.Type))
+			panic(fmt.Sprintf("Unknown validation type: %#v", valueType))
 		}
 	}
 	return diags
@@ -2334,6 +2401,36 @@ func (m schemaMap) validateType(
 	}
 
 	return diags
+}
+
+// hasWriteOnly returns true if the schemaMap contains any WriteOnly attributes.
+func (m schemaMap) hasWriteOnly() bool {
+	for _, v := range m {
+		if v.WriteOnly {
+			return true
+		}
+
+		if v.Elem != nil {
+			switch t := v.Elem.(type) {
+			case *Resource:
+				return schemaMap(t.SchemaMap()).hasWriteOnly()
+			case *Schema:
+				if t.WriteOnly {
+					return true
+				}
+
+				// Test the edge case where elements in a collection are set to writeOnly.
+				// Technically, this is an invalid schema as collections cannot have write-only
+				// attributes. However, this method is not concerned with the validity of the schema.
+				isNestedWriteOnly := schemaMap(map[string]*Schema{"nested": t}).hasWriteOnly()
+				if isNestedWriteOnly {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
 }
 
 // Zero returns the zero value for a type.
